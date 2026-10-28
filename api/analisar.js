@@ -1,15 +1,6 @@
-export const config = { runtime: "edge" };
-
 const DEFAULT_MODEL = "claude-sonnet-5-5";
 const MAX_TOKENS = 16000;
 const MAX_PROMPT_CHARS = 250000;
-
-function json(status, obj) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
 
 function sameCode(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
@@ -18,21 +9,22 @@ function sameCode(a, b) {
   return diff === 0;
 }
 
-export default async function handler(request) {
-  if (request.method !== "POST") return json(405, { error: "method_not_allowed" });
+export default async function handler(req, res) {
+  res.setHeader("cache-control", "no-store");
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   const accessCode = process.env.ACCESS_CODE;
-  if (!apiKey || !accessCode) return json(500, { error: "function_not_configured" });
-  if (!sameCode(request.headers.get("x-access-code") || "", accessCode)) {
-    return json(401, { error: "invalid_access_code" });
+  if (!apiKey || !accessCode) return res.status(500).json({ error: "function_not_configured" });
+  if (!sameCode(String(req.headers["x-access-code"] || ""), accessCode)) {
+    return res.status(401).json({ error: "invalid_access_code" });
   }
 
-  let body;
-  try { body = await request.json(); } catch { return json(400, { error: "invalid_body" }); }
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { body = null; } }
   const prompt = body && body.prompt;
-  if (typeof prompt !== "string" || !prompt.trim()) return json(400, { error: "missing_prompt" });
-  if (prompt.length > MAX_PROMPT_CHARS) return json(413, { error: "prompt_too_large" });
+  if (typeof prompt !== "string" || !prompt.trim()) return res.status(400).json({ error: "missing_prompt" });
+  if (prompt.length > MAX_PROMPT_CHARS) return res.status(413).json({ error: "prompt_too_large" });
 
   const upstream = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -49,11 +41,21 @@ export default async function handler(request) {
     }),
   });
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "content-type": upstream.headers.get("content-type") || "text/event-stream",
-      "cache-control": "no-store",
-    },
-  });
+  res.status(upstream.status);
+  res.setHeader("content-type", upstream.headers.get("content-type") || "text/event-stream");
+  if (!upstream.body) return res.end();
+
+  const reader = upstream.body.getReader();
+  req.on("close", () => { reader.cancel().catch(() => {}); });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(Buffer.from(value));
+    }
+  } catch {
+    // conexão encerrada pelo navegador ou pelo serviço
+  } finally {
+    res.end();
+  }
 }
